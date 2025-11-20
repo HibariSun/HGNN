@@ -86,7 +86,7 @@ class AdvancedTrainer:
         self.device = device
         self.label_smoothing = label_smoothing
 
-    def train_epoch(self, H, train_pos, train_neg, optimizer, criterion, drop_edge_rate=0.1):  # 训练一个完整的epoch
+    def train_epoch(self, hypergraphs, train_pos, train_neg, optimizer, criterion, drop_edge_rate=0.1):  # 训练一个完整的epoch
         """
         参数：
         H：超图关联矩阵
@@ -99,7 +99,7 @@ class AdvancedTrainer:
         """
         self.model.train()  # 设置训练模式
 
-        predictions = self.model(H, drop_edge_rate=drop_edge_rate)  # 前向传播
+        predictions = self.model(hypergraphs, drop_edge_rate=drop_edge_rate)  # 前向传播
 
         # 初始化损失
         loss = 0
@@ -132,7 +132,7 @@ class AdvancedTrainer:
 
         return loss.item()  # 返回损失
 
-    def evaluate(self, H, test_pos, test_neg):  # 评估模型在测试集上的性能
+    def evaluate(self, hypergraphs, test_pos, test_neg):  # 评估模型在测试集上的性能
         """
         参数：
         H：超图关联矩阵
@@ -148,7 +148,7 @@ class AdvancedTrainer:
 
         # 无梯度前向传播
         with torch.no_grad():
-            predictions = self.model(H)
+            predictions = self.model(hypergraphs)
 
         # 初始化列表
         y_true = []
@@ -292,12 +292,17 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
 
         # === 2.3 使用当前折的训练关联矩阵和相似性构造超图 ===
         hg_constructor = HypergraphConstructor(train_assoc_matrix, snorna_sim_fold, disease_sim_fold)
-        H = hg_constructor.construct_hypergraph(
+        H_main, H_snorna, H_disease = hg_constructor.construct_hypergraph(
             k_snorna=k_snorna,
             k_disease=k_disease,
             use_association_edges=use_association_edges,
             association_weight=association_weight
         )
+        hypergraphs = {
+            "main": H_main,
+            "snorna": H_snorna,
+            "disease": H_disease,
+        }
 
         # === 2.4 构建模型（输入特征也使用当前折的相似性矩阵） ===
         model = DeepHypergraphNN(
@@ -328,11 +333,11 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
             lr_current = scheduler.step(epoch)
 
             # 训练一个 epoch
-            train_loss = trainer.train_epoch(H, train_pos, train_neg, optimizer, criterion)
+            train_loss = trainer.train_epoch(hypergraphs, train_pos, train_neg, optimizer, criterion)
 
             # 每 10 个 epoch 在当前折的验证集上评估一次
             if epoch % 10 == 0:
-                auc, aupr, _, _ = trainer.evaluate(H, test_pos, test_neg)
+                auc, aupr, _, _ = trainer.evaluate(hypergraphs, test_pos, test_neg)
 
                 pbar.set_postfix({
                     "Loss": f"{train_loss:.4f}",
@@ -353,7 +358,7 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
                     break
 
         # === 2.5 使用当前折对应的超图在测试集上做最终评估 ===
-        auc, aupr, y_true, y_scores = trainer.evaluate(H, test_pos, test_neg)
+        auc, aupr, y_true, y_scores = trainer.evaluate(hypergraphs, test_pos, test_neg)
 
         print(f"\nFold {fold + 1} 最终结果:")
         print(f"  AUC:  {auc:.4f}")

@@ -199,12 +199,14 @@ class AdvancedHypergraphBlock(nn.Module):
         self.residual_proj = nn.Linear(in_features,
                                        out_features) if in_features != out_features else nn.Identity()  # 处理维度不匹配的残差连接
 
-    def forward(self, X, H):  # 执行高级超图块的前向传播
+    def forward(self, X, hypergraphs):  # 执行高级超图块的前向传播
         identity = self.residual_proj(X)  # 保存残差基准
 
-        # 超图卷积 + 残差 + 归一化
-        X = self.hgc(X, H)
-        # 残差连接 + 层归一化
+        # 超图卷积（同时融合多个超图的消息，取平均）
+        outputs = []
+        for H in hypergraphs:
+            outputs.append(self.hgc(X, H))
+        X = sum(outputs) / len(outputs)
         X = self.norm1(X + identity)
 
         # 双重注意力
@@ -340,10 +342,13 @@ class DeepHypergraphNN(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, H, drop_edge_rate=0.0):  # 执行完整的前向传播
+    def forward(self, hypergraphs, drop_edge_rate=0.0):  # 执行完整的前向传播
         # DropEdge数据增强
         if self.training and drop_edge_rate > 0:
-            H = self._drop_edge(H, drop_edge_rate)
+            hypergraphs = {
+                key: self._drop_edge(hg, drop_edge_rate)
+                for key, hg in hypergraphs.items()
+            }
 
         # 多尺度特征提取
         # 三个分支并行处理
@@ -362,8 +367,9 @@ class DeepHypergraphNN(nn.Module):
         X = torch.cat([snorna_feat, disease_feat], dim=0)
 
         # 通过超图卷积块
+        hg_list = [hypergraphs["main"], hypergraphs["snorna"], hypergraphs["disease"]]
         for hg_block in self.hg_blocks:
-            X = hg_block(X, H)
+            X = hg_block(X, hg_list)
 
         # 全局注意力
         X = self.global_attention(X)

@@ -128,3 +128,56 @@ class HypergraphConstructor:
         knn_graph = (knn_graph + knn_graph.T) / 2  # 对称化
 
         return knn_graph
+
+    def construct_multi_hypergraph(self, k_snorna=15, k_disease=15,
+                                   use_association_edges=True,
+                                   association_weight=0.5):
+        """
+        构建三个超图：
+          - H_all    : 原来代码里的“相似性 + 关联”超图（保持完全兼容）
+          - H_sno    : 只包含 snoRNA KNN 相似性超边
+          - H_disease: 只包含 disease KNN 相似性超边
+
+        返回:
+            H_all, H_sno, H_disease
+        """
+        # 先用原来的函数构建 H_all（包含相似性 + 关联信息）
+        H_all = self.construct_hypergraph(
+            k_snorna=k_snorna,
+            k_disease=k_disease,
+            use_association_edges=use_association_edges,
+            association_weight=association_weight
+        )
+
+        # 基于当前折的 GIPK 相似性构建 KNN 图
+        snorna_knn = self._build_knn_graph(self.snorna_sim, k_snorna)
+        disease_knn = self._build_knn_graph(self.disease_sim, k_disease)
+
+        num_nodes = self.num_snorna + self.num_disease
+
+        # === H_sno：只用 snoRNA 相似性构造的超图 ===
+        # 每个 snoRNA 节点对应一条超边，超边里是它的 K 近邻
+        H_sno = np.zeros((num_nodes, self.num_snorna), dtype=np.float32)
+        for i in range(self.num_snorna):
+            neighbors = np.where(snorna_knn[i] > 0)[0]
+            for neighbor in neighbors:
+                # 这里只在 snoRNA 节点之间连边，因此行索引是 snoRNA 的编号
+                H_sno[neighbor, i] = snorna_knn[i, neighbor]
+
+        # === H_disease：只用 disease 相似性构造的超图 ===
+        H_dis = np.zeros((num_nodes, self.num_disease), dtype=np.float32)
+        for j in range(self.num_disease):
+            neighbors = np.where(disease_knn[j] > 0)[0]
+            for neighbor in neighbors:
+                # disease 节点在整体节点中的索引要加上 self.num_snorna 偏移
+                H_dis[self.num_snorna + neighbor, j] = disease_knn[j, neighbor]
+
+        H_sno = torch.FloatTensor(H_sno).to(device)
+        H_dis = torch.FloatTensor(H_dis).to(device)
+
+        print(f"  ✓ 多超图构建完成: "
+              f"H_all={tuple(H_all.shape)}, "
+              f"H_sno={tuple(H_sno.shape)}, "
+              f"H_dis={tuple(H_dis.shape)}")
+
+        return H_all, H_sno, H_dis

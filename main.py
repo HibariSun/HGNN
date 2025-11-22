@@ -44,7 +44,7 @@ def main():
     association_weight_list = [0.8]
     # 训练相关参数
     n_splits = 5
-    epochs = 200
+    epochs = 300
     lr = 0.0001
     patience = 30
 

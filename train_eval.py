@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from gipk import GIPKCalculator
 from hypergraph import HypergraphConstructor
-from models import DeepHypergraphNN
+from models import TripleHypergraphNN
 from data_utils import prepare_samples
 from utils import device
 
@@ -73,7 +73,7 @@ class WarmupCosineScheduler:
 
 
 # 训练器
-class AdvancedTrainer:
+class TripleHypergraphTrainer:
     """高级训练器"""
 
     def __init__(self, model, device, label_smoothing=0.1):  # 初始化训练器
@@ -86,26 +86,16 @@ class AdvancedTrainer:
         self.device = device
         self.label_smoothing = label_smoothing
 
-    def train_epoch(self, H, train_pos, train_neg, optimizer, criterion, drop_edge_rate=0.1):  # 训练一个完整的epoch
-        """
-        参数：
-        H：超图关联矩阵
-        train_pos：训练集正样本
-        train_neg：训练集负样本
-        optimizer：优化器（如Adam）
-        criterion：损失函数（如FocalLoss）
-        drop_edge_rate：边丢弃率（默认0.1）
-        返回值：loss.item()：平均训练损失
-        """
-        self.model.train()  # 设置训练模式
+    def train_epoch(self, H_all, H_sno, H_dis, train_pos, train_neg, optimizer, criterion, drop_edge_rate=0.1):
+        """训练一个epoch"""
+        self.model.train()
 
-        predictions = self.model(H, drop_edge_rate=drop_edge_rate)  # 前向传播
+        # 前向传播 - 传入三个超图
+        predictions = self.model(H_all, H_sno, H_dis, drop_edge_rate=drop_edge_rate)
 
-        # 初始化损失
         loss = 0
         count = 0
 
-        # 计算标签平滑后的标签
         pos_label = 1.0 - self.label_smoothing
         neg_label = self.label_smoothing
 
@@ -121,36 +111,23 @@ class AdvancedTrainer:
                               torch.tensor([neg_label]).to(self.device))
             count += 1
 
-        # 计算平均损失
         loss = loss / count
 
         # 反向传播和优化
-        optimizer.zero_grad()  # 清空梯度
-        loss.backward()  # 反向传播
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # 梯度裁剪
-        optimizer.step()  # 更新参数
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-        return loss.item()  # 返回损失
+        return loss.item()
 
-    def evaluate(self, H, test_pos, test_neg):  # 评估模型在测试集上的性能
-        """
-        参数：
-        H：超图关联矩阵
-        test_pos：测试集正样本
-        test_neg：测试集负样本
-        返回值：
-        auc_score：AUC分数
-        aupr_score：AUPR分数
-        y_true：真实标签
-        y_scores：预测分数
-        """
-        self.model.eval()  # 设置评估模式
+    def evaluate(self, H_all, H_sno, H_dis, test_pos, test_neg):
+        """评估模型"""
+        self.model.eval()
 
-        # 无梯度前向传播
         with torch.no_grad():
-            predictions = self.model(H)
+            predictions = self.model(H_all, H_sno, H_dis)
 
-        # 初始化列表
         y_true = []
         y_scores = []
 
@@ -164,15 +141,13 @@ class AdvancedTrainer:
             y_true.append(0)
             y_scores.append(predictions[i, j].cpu().item())
 
-        # 转换为NumPy数组
         y_true = np.array(y_true)
         y_scores = np.array(y_scores)
 
-        # 计算评估指标
         auc_score = roc_auc_score(y_true, y_scores)
         aupr_score = average_precision_score(y_true, y_scores)
 
-        return auc_score, aupr_score, y_true, y_scores  # 返回结果
+        return auc_score, aupr_score, y_true, y_scores
 
 
 # 交叉验证
@@ -290,21 +265,23 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
             snorna_sim_fold = snorna_sim
             disease_sim_fold = disease_sim
 
-        # === 2.3 使用当前折的训练关联矩阵和相似性构造超图 ===
+        # === 2.3 使用当前折的训练关联矩阵和相似性构造多超图 ===
         hg_constructor = HypergraphConstructor(train_assoc_matrix, snorna_sim_fold, disease_sim_fold)
-        H = hg_constructor.construct_hypergraph(
+        H_all, H_sno, H_dis = hg_constructor.construct_multi_hypergraph(
             k_snorna=k_snorna,
             k_disease=k_disease,
             use_association_edges=use_association_edges,
             association_weight=association_weight
         )
 
-        # === 2.4 构建模型（输入特征也使用当前折的相似性矩阵） ===
-        model = DeepHypergraphNN(
+
+        # === 2.4 构建模型（输入特征也使用当前折的相似性矩阵 + 训练关联矩阵） ===
+        model = TripleHypergraphNN(
             num_snorna=num_snorna,
             num_disease=num_disease,
             snorna_sim=snorna_sim_fold,
             disease_sim=disease_sim_fold,
+            assoc_matrix=train_assoc_matrix,
             hidden_dims=[512, 384, 256, 128, 64],
             num_heads=8,
             dropout=0.2
@@ -316,7 +293,7 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
         scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=10, total_epochs=epochs)
 
         # 训练器
-        trainer = AdvancedTrainer(model, device, label_smoothing=0.1)
+        trainer = TripleHypergraphTrainer(model, device, label_smoothing=0.1)
 
         # 训练循环与早停
         best_auc = 0.0
@@ -328,11 +305,18 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
             lr_current = scheduler.step(epoch)
 
             # 训练一个 epoch
-            train_loss = trainer.train_epoch(H, train_pos, train_neg, optimizer, criterion)
+            train_loss = trainer.train_epoch(
+                H_all, H_sno, H_dis,
+                train_pos, train_neg,
+                optimizer, criterion
+            )
 
             # 每 10 个 epoch 在当前折的验证集上评估一次
             if epoch % 10 == 0:
-                auc, aupr, _, _ = trainer.evaluate(H, test_pos, test_neg)
+                auc, aupr, _, _ = trainer.evaluate(
+                    H_all, H_sno, H_dis,
+                    test_pos, test_neg
+                )
 
                 pbar.set_postfix({
                     "Loss": f"{train_loss:.4f}",
@@ -353,7 +337,10 @@ def cross_validation(association_matrix, snorna_sim, disease_sim,
                     break
 
         # === 2.5 使用当前折对应的超图在测试集上做最终评估 ===
-        auc, aupr, y_true, y_scores = trainer.evaluate(H, test_pos, test_neg)
+        auc, aupr, y_true, y_scores = trainer.evaluate(
+            H_all, H_sno, H_dis,
+            test_pos, test_neg
+        )
 
         print(f"\nFold {fold + 1} 最终结果:")
         print(f"  AUC:  {auc:.4f}")

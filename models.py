@@ -169,7 +169,59 @@ class DualAttentionModule(nn.Module):
         return x
 
 
-class AdvancedHypergraphBlock(nn.Module):
+class CrossAttentionFusion(nn.Module):
+    """
+    交叉注意力融合模块
+    用于融合来自三个超图的特征
+    """
+
+    def __init__(self, dim, num_heads=4, dropout=0.3):
+        super(CrossAttentionFusion, self).__init__()
+
+        # 三个超图特征的查询、键、值投影
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+
+        self.cross_attention = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # 门控机制,动态调整融合权重
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat_all, feat_sno, feat_dis):
+        """
+        融合三个超图的特征
+        feat_all: 来自统一超图的特征 [N, dim]
+        feat_sno: 来自snoRNA超图的特征 [N, dim]
+        feat_dis: 来自disease超图的特征 [N, dim]
+        """
+        # 堆叠特征用于交叉注意力
+        stacked = torch.stack([feat_all, feat_sno, feat_dis], dim=1)  # [N, 3, dim]
+
+        # 交叉注意力
+        q = self.q_proj(feat_all).unsqueeze(1)  # [N, 1, dim]
+        k = self.k_proj(stacked)  # [N, 3, dim]
+        v = self.v_proj(stacked)  # [N, 3, dim]
+
+        attn_out, _ = self.cross_attention(q, k, v)  # [N, 1, dim]
+        attn_out = attn_out.squeeze(1)  # [N, dim]
+
+        # 门控融合
+        gate_input = torch.cat([feat_all, feat_sno, feat_dis], dim=1)  # [N, 3*dim]
+        gate_weight = self.gate(gate_input)  # [N, dim]
+
+        # 残差连接
+        output = self.norm(feat_all + gate_weight * self.dropout(attn_out))
+
+        return output
+
+
+class TripleHypergraphBlock(nn.Module):
     """超图块"""
 
     def __init__(self, in_features, out_features, num_heads=8, dropout=0.3):  # 初始化高级超图块的所有组件
@@ -179,40 +231,58 @@ class AdvancedHypergraphBlock(nn.Module):
         num_heads：多头注意力的头数（默认8）
         dropout：Dropout比率（默认0.3）
         """
-        super(AdvancedHypergraphBlock, self).__init__()
+        super(TripleHypergraphBlock, self).__init__()
 
-        self.hgc = EnhancedHypergraphConvolution(in_features, out_features, dropout=dropout)  # 增强超图卷积层
-        self.dual_attention = DualAttentionModule(out_features, num_heads, dropout)  # 双重注意力模块
+        # 三个超图各自的卷积层
+        self.hgc_all = EnhancedHypergraphConvolution(in_features, out_features, dropout=dropout)
+        self.hgc_sno = EnhancedHypergraphConvolution(in_features, out_features, dropout=dropout)
+        self.hgc_dis = EnhancedHypergraphConvolution(in_features, out_features, dropout=dropout)
 
-        self.ffn = nn.Sequential(  # 前馈神经网络（FFN）
-            nn.Linear(out_features, out_features * 4),  # 扩展4倍
-            nn.GELU(),  # 平滑激活函数
+        # 交叉注意力融合
+        self.fusion = CrossAttentionFusion(out_features, num_heads, dropout)
+
+        # 双重注意力
+        self.dual_attention = DualAttentionModule(out_features, num_heads, dropout)
+
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(out_features, out_features * 4),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(out_features * 4, out_features),  # 压缩回原维度
+            nn.Linear(out_features * 4, out_features),
             nn.Dropout(dropout)
         )
 
         # 层归一化
-        self.norm1 = nn.LayerNorm(out_features)  # 超图卷积后
-        self.norm2 = nn.LayerNorm(out_features)  # 双重注意力后
+        self.norm1 = nn.LayerNorm(out_features)
+        self.norm2 = nn.LayerNorm(out_features)
 
-        self.residual_proj = nn.Linear(in_features,
-                                       out_features) if in_features != out_features else nn.Identity()  # 处理维度不匹配的残差连接
+        # 残差投影
+        self.residual_proj = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
 
-    def forward(self, X, H):  # 执行高级超图块的前向传播
-        identity = self.residual_proj(X)  # 保存残差基准
+    def forward(self, X, H_all, H_sno, H_dis):
+        """
+        X: 节点特征 [N, in_features]
+        H_all: 统一超图
+        H_sno: snoRNA超图
+        H_dis: disease超图
+        """
+        identity = self.residual_proj(X)
 
-        # 超图卷积 + 残差 + 归一化
-        X = self.hgc(X, H)
-        # 残差连接 + 层归一化
+        # 在三个超图上分别做卷积
+        feat_all = self.hgc_all(X, H_all)
+        feat_sno = self.hgc_sno(X, H_sno)
+        feat_dis = self.hgc_dis(X, H_dis)
+
+        # 交叉注意力融合
+        X = self.fusion(feat_all, feat_sno, feat_dis)
         X = self.norm1(X + identity)
 
         # 双重注意力
         X_att = self.dual_attention(X)
-        # 残差连接 + 层归一化
         X = self.norm2(X + X_att)
 
-        # 前馈网络 + 残差
+        # 前馈网络
         X = X + self.ffn(X)
 
         return X
@@ -247,60 +317,70 @@ class FeatureEnhancementModule(nn.Module):
         return self.enhance(x)
 
 
-class DeepHypergraphNN(nn.Module):
+class TripleHypergraphNN(nn.Module):
     """深度超图神经网络"""
 
-    def __init__(self, num_snorna, num_disease, snorna_sim, disease_sim,
+    def __init__(self, num_snorna, num_disease, snorna_sim, disease_sim, assoc_matrix,
                  hidden_dims=[512, 384, 256, 128, 64], num_heads=8, dropout=0.2):  # 初始化深度超图神经网络的所有组件
         """
         num_snorna：snoRNA的数量
         num_disease：disease的数量
         snorna_sim：snoRNA的GIPK相似性矩阵
         disease_sim：disease的GIPK相似性矩阵
+        assoc_matrix：当前折的训练关联矩阵，用于构造基于 adj_index 的节点初始特征
         hidden_dims：隐藏层维度列表（默认[512, 384, 256, 128, 64]）
         num_heads：注意力头数（默认8）
         dropout：Dropout比率（默认0.2）
         """
-        super(DeepHypergraphNN, self).__init__()
+        super(TripleHypergraphNN, self).__init__()
 
         self.num_snorna = num_snorna
         self.num_disease = num_disease
 
-        # 可学习的特征嵌入
-        self.snorna_features = nn.Parameter(torch.FloatTensor(snorna_sim), requires_grad=True)
-        self.disease_features = nn.Parameter(torch.FloatTensor(disease_sim), requires_grad=True)
+        # ===== 初始特征: 只使用关联矩阵 =====
+        assoc_tensor = torch.as_tensor(assoc_matrix, dtype=torch.float32)
 
-        # 特征增强
-        self.snorna_enhance = FeatureEnhancementModule(num_snorna, hidden_dims[0], dropout)
-        self.disease_enhance = FeatureEnhancementModule(num_disease, hidden_dims[0], dropout)
+        # snoRNA节点初始特征: adj_index的每一行 [num_snorna, num_disease]
+        snorna_feat = assoc_tensor
+        # disease节点初始特征: adj_index的每一列(转置) [num_disease, num_snorna]
+        disease_feat = assoc_tensor.t()
+
+        # 可学习的特征嵌入
+        self.snorna_features = nn.Parameter(snorna_feat, requires_grad=True)
+        self.disease_features = nn.Parameter(disease_feat, requires_grad=True)
+
+        snorna_in_dim = self.snorna_features.size(1)  # num_disease
+        disease_in_dim = self.disease_features.size(1)  # num_snorna
+
+        # 特征增强 - 将不同维度的特征映射到统一空间
+        self.snorna_enhance = FeatureEnhancementModule(snorna_in_dim, hidden_dims[0], dropout)
+        self.disease_enhance = FeatureEnhancementModule(disease_in_dim, hidden_dims[0], dropout)
 
         # 多尺度特征提取
         branch_dims = [hidden_dims[0] // 4, hidden_dims[0] // 4, hidden_dims[0] // 2]
 
-        # snoRNA多尺度分支
         self.snorna_multi_scale = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(num_snorna, dim),
+                nn.Linear(snorna_in_dim, dim),
                 nn.BatchNorm1d(dim),
                 nn.ELU()
             ) for dim in branch_dims
         ])
 
-        # disease多尺度分支
         self.disease_multi_scale = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(num_disease, dim),
+                nn.Linear(disease_in_dim, dim),
                 nn.BatchNorm1d(dim),
                 nn.ELU()
             ) for dim in branch_dims
         ])
 
-        # 超图卷积块
+        # 三超图卷积块
         self.hg_blocks = nn.ModuleList()
         dims = [hidden_dims[0]] + hidden_dims
         for i in range(len(hidden_dims)):
             self.hg_blocks.append(
-                AdvancedHypergraphBlock(dims[i], dims[i + 1], num_heads, dropout)
+                TripleHypergraphBlock(dims[i], dims[i + 1], num_heads, dropout)
             )
 
         # 全局池化注意力
@@ -309,86 +389,83 @@ class DeepHypergraphNN(nn.Module):
         # 预测头
         final_dim = hidden_dims[-1]
         self.predictor = nn.Sequential(
-            # 第1层：扩展
             nn.Linear(final_dim * 2, final_dim * 2),
             nn.BatchNorm1d(final_dim * 2),
             nn.ELU(),
             nn.Dropout(dropout),
-            # 第2层：压缩
             nn.Linear(final_dim * 2, final_dim),
             nn.BatchNorm1d(final_dim),
             nn.ELU(),
             nn.Dropout(dropout),
-            # 第3层：进一步压缩
             nn.Linear(final_dim, final_dim // 2),
             nn.ELU(),
             nn.Dropout(dropout),
-            # 第4层：输出层
             nn.Linear(final_dim // 2, 1),
             nn.Sigmoid()
         )
 
         self._init_weights()
 
-    def _init_weights(self):  # 初始化网络权重
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)  # 线性层（Linear）
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, H, drop_edge_rate=0.0):  # 执行完整的前向传播
-        # DropEdge数据增强
+    def forward(self, H_all, H_sno, H_dis, drop_edge_rate=0.0):
+        """
+        H_all: 统一超图 [N, M_all]
+        H_sno: snoRNA超图 [N, M_sno]
+        H_dis: disease超图 [N, M_dis]
+        """
+        # DropEdge 数据增强
         if self.training and drop_edge_rate > 0:
-            H = self._drop_edge(H, drop_edge_rate)
+            H_all = self._drop_edge(H_all, drop_edge_rate)
+            H_sno = self._drop_edge(H_sno, drop_edge_rate)
+            H_dis = self._drop_edge(H_dis, drop_edge_rate)
 
         # 多尺度特征提取
-        # 三个分支并行处理
         snorna_features_multi = [scale(self.snorna_features) for scale in self.snorna_multi_scale]
         disease_features_multi = [scale(self.disease_features) for scale in self.disease_multi_scale]
 
-        # 拼接多尺度特征
         snorna_feat = torch.cat(snorna_features_multi, dim=1)
         disease_feat = torch.cat(disease_features_multi, dim=1)
 
         # 特征增强与融合
-        snorna_feat = snorna_feat + self.snorna_enhance(self.snorna_features)  # [num_snorna, 512]
-        disease_feat = disease_feat + self.disease_enhance(self.disease_features)  # [num_disease, 512]
+        snorna_feat = snorna_feat + self.snorna_enhance(self.snorna_features)
+        disease_feat = disease_feat + self.disease_enhance(self.disease_features)
 
         # 拼接所有节点特征
         X = torch.cat([snorna_feat, disease_feat], dim=0)
 
-        # 通过超图卷积块
+        # 通过三超图卷积块
         for hg_block in self.hg_blocks:
-            X = hg_block(X, H)
+            X = hg_block(X, H_all, H_sno, H_dis)
 
         # 全局注意力
         X = self.global_attention(X)
 
         # 分离特征
-        snorna_embed = X[:self.num_snorna]  # [361, 64]
-        disease_embed = X[self.num_snorna:]  # [780, 64]
+        snorna_embed = X[:self.num_snorna]
+        disease_embed = X[self.num_snorna:]
 
-        # 预测所有关联
-        # 扩展维度以计算所有配对
+        # pair-wise 拼接 + predictor
         snorna_expanded = snorna_embed.unsqueeze(1).expand(-1, self.num_disease, -1)
         disease_expanded = disease_embed.unsqueeze(0).expand(self.num_snorna, -1, -1)
 
-        # 拼接配对特征
         combined = torch.cat([snorna_expanded, disease_expanded], dim=2)
-        # 展平为二维矩阵
         combined = combined.view(-1, combined.size(-1))
 
-        # 预测关联分数
-        scores = self.predictor(combined)  # [281580, 128] → [281580, 1]
-        scores = scores.view(self.num_snorna, self.num_disease)  # [361, 780]
+        scores = self.predictor(combined)
+        scores = scores.view(self.num_snorna, self.num_disease)
 
         return scores
 
-    def _drop_edge(self, H, rate):  # DropEdge数据增强
-        """DropEdge数据增强"""
+    def _drop_edge(self, H, rate):
+        """DropEdge 数据增强"""
         mask = torch.rand_like(H) > rate
         return H * mask.float()
